@@ -2,7 +2,8 @@
   "name": "cc-weixin",
   "version": "0.2.0",
   "type": "module",
-  "description": "在微信里使用 Claude Code Agent — 基于腾讯官方 iLink Bot API",
+  "description": "基于 cc-weixin 的微信 AI 角色机器人演示",
+  "private": true,
   "keywords": [
     "wechat",
     "weixin",
@@ -26,8 +27,11 @@
     "lib/"
   ],
   "scripts": {
-    "start": "node cc-weixin.mjs",
-    "login": "node cc-weixin.mjs --login"
+    "prestart": "node emotion-engine.cjs sync",
+    "start": "node cc-weixin.mjs --no-tui",
+    "login": "node emotion-engine.cjs sync && node cc-weixin.mjs --login --no-tui",
+    "emotion:show": "node emotion-engine.cjs show",
+    "emotion:event": "node emotion-engine.cjs event"
   },
   "engines": {
     "node": ">=22"

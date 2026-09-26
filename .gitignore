@@ -4,3 +4,9 @@ package-lock.json
 dist/
 .env
 .weixin-token.json
+CLAUDE.md
+AGENTS.md
+emotion-state.json
+sessions.json
+.claude/
+*.log
