@@ -378,7 +378,8 @@ function getRandomReplyDelay(heat = 0) {
               const timeStr = `现在是${TIME_LABELS[hour]}${hour}点多\n\n`;
               console.log(`   💰 [${s.name}] 演示角色想说话了...`);
               lastProactive[s.name] = now.getTime();
-              const reply = await askClaude(timeStr + s.prompt, lastUserId);
+              // persist=false：主动消息不进用户会话，避免污染对话历史
+              const reply = await askClaude(timeStr + s.prompt, lastUserId, false);
             if (reply) {
               // 分条发送主动消息
               await sendReplyInParts(baseUrl, token, lastUserId, reply, lastCtx);
