@@ -18,7 +18,19 @@ if (noTui) {
   // ——— 纯 CLI 模式（原有逻辑）—————————————————————————————————————————————————————
   const { loadSession, login } = await import("./lib/auth.mjs");
   const { getUpdates, sendMessage, extractMessageContent } = await import("./lib/messaging.mjs");
-  const { askClaude } = await import("./lib/claude.mjs");
+  const { askAI, rememberDelivered, rememberProactive, usingChatGPT } = await import("./lib/ai.mjs");
+  const { parseAllowedUserIds, isAllowedUser, assertAllowedUserConfiguration } = await import("./lib/allowed-users.mjs");
+  const { createProactiveContextStore } = await import("./lib/proactive-context.mjs");
+  const { fileURLToPath } = await import("node:url");
+  const proactiveContext = createProactiveContextStore(fileURLToPath(new URL("./pending-proactive.json", import.meta.url)));
+  const testProactiveOnce = process.argv.includes("--test-proactive-once");
+  const testTrigger = process.env.WECHAT_TEST_TRIGGER?.trim();
+  const testUserIdAllowlist = process.env.WECHAT_TEST_USER_ID?.trim();
+  const allowedUserIds = parseAllowedUserIds(process.env.WECHAT_ALLOWED_USER_IDS);
+  if (testProactiveOnce && !testTrigger) {
+    throw new Error('单次主动消息测试需要设置 WECHAT_TEST_TRIGGER，避免回复其他联系人');
+  }
+  assertAllowedUserConfiguration(usingChatGPT, testProactiveOnce, allowedUserIds);
 
   /**
    * 生成随机回复延迟，模拟真实人类的回复速度
@@ -113,7 +125,7 @@ function getRandomReplyDelay(heat = 0) {
   /**
    * 分条发送回复，模拟真人一条一条发的感觉
    */
- async function sendReplyInParts(baseUrl, token, toUserId, reply, ctx) {
+ async function sendReplyInParts(baseUrl, token, toUserId, reply, ctx, onPartSent) {
     // 按 ||| 或 ｜｜｜ 或单个 | 切分（兼容各种模型输出习惯）
     let parts = reply.split(/[\|｜]{2,3}/).map(s => s.trim()).filter(s => s);
     if (parts.length <= 1) {
@@ -133,6 +145,7 @@ function getRandomReplyDelay(heat = 0) {
       parts = parts.flatMap(s =>
         s.split(/[ \u3000\t]+(?=[\u4e00-\u9fff])/).map(x => x.trim()).filter(Boolean)
       );
+      if (parts.length === 0) throw new Error('模型回复没有可发送的文字');
 
       for (let i = 0; i < parts.length; i++) {
         if (i > 0) {
@@ -140,11 +153,17 @@ function getRandomReplyDelay(heat = 0) {
         await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
       }
       await sendMessage(baseUrl, token, toUserId, parts[i], ctx);
+      await onPartSent?.(parts[i]);
       console.log(`   ✅ ${parts[i].slice(0, 60)}${parts[i].length > 60 ? "…" : ""}`);
     }
   }
 
   async function main() {
+    if (usingChatGPT) {
+      const { loadAuth } = await import('./lib/chatgpt-auth.mjs');
+      if (!loadAuth()?.accessToken) throw new Error('尚未授权 ChatGPT，请先运行 npm run chatgpt:login');
+      console.log('🤖 当前模型来源：ChatGPT 套餐授权');
+    }
     let session = forceLogin ? null : loadSession();
     if (session) {
       console.log(`✅ 已连接（Bot: ${session.accountId}）\n`);
@@ -167,7 +186,20 @@ function getRandomReplyDelay(heat = 0) {
     let lastInteraction = Date.now();
     let chatHeat = 0;
     let lastHeatDecay = Date.now();
-     const lastProactive = {};
+    const HEAT_GAIN_PER_MESSAGE = 1;
+    const HEAT_DECAY_PER_SECOND = 0.01;
+    const lastProactive = {};
+    let testProactiveSent = false;
+    let testUserId = null;
+
+    async function sendProactive(prompt, toUserId, ctx) {
+      const reply = await askAI(prompt, null);
+      if (!reply) return;
+      await sendReplyInParts(baseUrl, token, toUserId, reply, ctx,
+        part => usingChatGPT ? rememberProactive(toUserId, part) : proactiveContext.recordSent(toUserId, part));
+      lastInteraction = Date.now();
+      console.log("");
+    }
 
     // ——— 连续消息合并处理（批处理）———
     const BATCH_MODE_CHANCE = 0.70;     // 70% 概率进入批次模式
@@ -190,9 +222,21 @@ function getRandomReplyDelay(heat = 0) {
 
        for (const msg of resp.msgs ?? []) {
          const from = msg.from_user_id;
+         if (!isAllowedUser(allowedUserIds, from)) continue;
          const content = await extractMessageContent(msg);
          if (content.text === "[空消息]" && content.images.length === 0) continue;
          const ctx = msg.context_token;
+
+         // 测试模式只接受指定触发语和同一位发送者，避免误发给旧联系人。
+         if (testProactiveOnce) {
+           if (testUserIdAllowlist && from !== testUserIdAllowlist) continue;
+           if (!testUserId) {
+             if (content.text?.trim() !== testTrigger) continue;
+             testUserId = from;
+           } else if (from !== testUserId) {
+             continue;
+           }
+         }
 
          lastUserId = from;
          lastCtx = ctx;
@@ -200,8 +244,8 @@ function getRandomReplyDelay(heat = 0) {
 
         // 热度机制：先衰减再加热，最大10
         const heatDecay = (Date.now() - lastHeatDecay) / 1000;
-        chatHeat = Math.max(0, chatHeat - heatDecay * 0.005);
-        chatHeat = Math.min(10, chatHeat + 2);
+        chatHeat = Math.max(0, chatHeat - heatDecay * HEAT_DECAY_PER_SECOND);
+        chatHeat = Math.min(10, chatHeat + HEAT_GAIN_PER_MESSAGE);
         lastHeatDecay = Date.now();
 
          console.log(`📡 [${new Date().toLocaleTimeString()}] ${from}`);
@@ -210,9 +254,10 @@ function getRandomReplyDelay(heat = 0) {
            console.log(`   🖼️ 包含 ${content.images.length} 张图片`);
          }
 
-          if (!batchModeActive) {
+          if (!batchModeActive || messageBuffer[0]?.from !== from) {
             // 决定模式：30% 秒回，70% 批次
-            const useBatch = Math.random() < BATCH_MODE_CHANCE;
+            // 不把不同用户的消息混进同一个批次。
+            const useBatch = !testProactiveOnce && !batchModeActive && Math.random() < BATCH_MODE_CHANCE;
             if (useBatch) {
               // 进入批次模式，缓冲消息等待收集更多
               messageBuffer.push({ from, content, ctx });
@@ -224,24 +269,21 @@ function getRandomReplyDelay(heat = 0) {
             } else {
               // 热度驱动延迟
               const heatDecayNow = (Date.now() - lastHeatDecay) / 1000;
-              const currentHeat = Math.max(0, chatHeat - heatDecayNow * 0.005);
-              let delay = 0;
+              const currentHeat = Math.max(0, chatHeat - heatDecayNow * HEAT_DECAY_PER_SECOND);
+              const delay = testProactiveOnce ? 0 : getRandomReplyDelay(currentHeat);
               let excuse = null;
 
-              if (currentHeat < 9) {
-                delay = getRandomReplyDelay(currentHeat);
-                if (delay > 1000) {
-                  const minutes = Math.floor(delay / 60000);
-                  const seconds = Math.floor((delay % 60000) / 1000);
-                  const timeStr = minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`;
-                  console.log(`   ⏳ 热度${currentHeat.toFixed(1)}/10 演示角色正在忙，约${timeStr}后回复...`);
-                  await new Promise(r => setTimeout(r, delay));
-                }
+              if (delay > 1000) {
+                const minutes = Math.floor(delay / 60000);
+                const seconds = Math.floor((delay % 60000) / 1000);
+                const timeStr = minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`;
+                console.log(`   ⏳ 热度${currentHeat.toFixed(1)}/10 演示角色正在忙，约${timeStr}后回复...`);
+                await new Promise(r => setTimeout(r, delay));
+              }
 
-                if (delay > 5 * 60 * 1000) {
-                  excuse = getRandomExcuse(delay);
-                  console.log(`   💬 借口：${excuse}`);
-                }
+              if (delay > 5 * 60 * 1000) {
+                excuse = getRandomExcuse(delay);
+                console.log(`   💬 借口：${excuse}`);
               }
 
               let aiContent = content;
@@ -272,11 +314,22 @@ function getRandomReplyDelay(heat = 0) {
                 }
 
                 process.stdout.write("   🤖 Claude 思考中...");
-                const reply = await askClaude(aiContent, isRawMode ? `raw-${from}` : from);
+                const modelContent = isRawMode || usingChatGPT ? aiContent : proactiveContext.addContext(aiContent, from);
+                const sessionUserId = isRawMode ? `raw-${from}` : from;
+                const reply = await askAI(modelContent, sessionUserId);
+                if (!isRawMode && !usingChatGPT) proactiveContext.clear(from);
               process.stdout.write(" 完成\n");
 
               await sendReplyInParts(baseUrl, token, from, reply, ctx);
+              await rememberDelivered(sessionUserId, modelContent, reply);
               console.log("");
+
+              // 只有正常回复真正发送成功，才启动一次主动消息测试。
+              if (testProactiveOnce && !testProactiveSent) {
+                testProactiveSent = true;
+                console.log("   🧪 单次主动消息测试...");
+                await sendProactive("作为演示角色，主动发一句简短的日常消息，让对方容易接着聊。只写要发送的话。", from, ctx);
+              }
             }
           } else {
             // 已经在批次模式，继续收集消息
@@ -342,15 +395,19 @@ function getRandomReplyDelay(heat = 0) {
           }
 
           process.stdout.write("   🤖 Claude 思考中...");
-          const reply = await askClaude(combinedContent, isRawMode ? `raw-${batch[0].from}` : batch[0].from);
+          const modelContent = isRawMode || usingChatGPT ? combinedContent : proactiveContext.addContext(combinedContent, batch[0].from);
+          const sessionUserId = isRawMode ? `raw-${batch[0].from}` : batch[0].from;
+          const reply = await askAI(modelContent, sessionUserId);
+          if (!isRawMode && !usingChatGPT) proactiveContext.clear(batch[0].from);
           process.stdout.write(" 完成\n");
 
           await sendReplyInParts(baseUrl, token, batch[0].from, reply, batch[0].ctx);
+          await rememberDelivered(sessionUserId, modelContent, reply);
           console.log("");
        }
 
         // ——— 主动消息调度系统 ——————————————————————————————————
-        if (lastUserId) {
+        if (lastUserId && !testProactiveOnce) {
           const now = new Date();
           const hour = now.getHours();
           const silence = Date.now() - lastInteraction;
@@ -378,18 +435,17 @@ function getRandomReplyDelay(heat = 0) {
               const timeStr = `现在是${TIME_LABELS[hour]}${hour}点多\n\n`;
               console.log(`   💰 [${s.name}] 演示角色想说话了...`);
               lastProactive[s.name] = now.getTime();
-              // persist=false：主动消息不进用户会话，避免污染对话历史
-              const reply = await askClaude(timeStr + s.prompt, lastUserId, false);
-            if (reply) {
-              // 分条发送主动消息
-              await sendReplyInParts(baseUrl, token, lastUserId, reply, lastCtx);
-              lastInteraction = Date.now();
-              console.log("");
-            }
+              // 主动消息的生成指令不能写入收件人的普通聊天会话。
+              await sendProactive(timeStr + s.prompt, lastUserId, lastCtx);
             break;
           }
         }
       } catch (err) {
+        if (/\b402\b.*Insufficient account balance/i.test(err.message || "")) {
+          console.error("❌ 模型 API 账户余额不足（402），已停止。请检查所用模型平台的余额或换用可用的 API Key。");
+          process.exitCode = 1;
+          break;
+        }
         if (err.message?.includes("session timeout") || err.message?.includes("-14")) {
           console.error("❌ Session 已过期，请重新运行 npm start -- --login");
           process.exit(1);

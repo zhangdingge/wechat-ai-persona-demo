@@ -31,7 +31,12 @@
     "start": "node cc-weixin.mjs --no-tui",
     "login": "node emotion-engine.cjs sync && node cc-weixin.mjs --login --no-tui",
     "emotion:show": "node emotion-engine.cjs show",
-    "emotion:event": "node emotion-engine.cjs event"
+    "emotion:event": "node emotion-engine.cjs event",
+    "chatgpt:login": "node chatgpt-cli.mjs login",
+    "chatgpt:models": "node chatgpt-cli.mjs models",
+    "chatgpt:test": "node chatgpt-cli.mjs test",
+    "chatgpt:status": "node chatgpt-cli.mjs status",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=22"

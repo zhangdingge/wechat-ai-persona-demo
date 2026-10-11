@@ -1,4 +1,5 @@
 node_modules/
+node_modules
 package-lock.json
 *.tgz
 dist/
@@ -8,5 +9,11 @@ CLAUDE.md
 AGENTS.md
 emotion-state.json
 sessions.json
+pending-proactive.json
+pending-proactive.json.*.tmp
+.chatgpt-auth.json
+.chatgpt-auth.json.*.tmp
+chatgpt-history.json
+chatgpt-history.json.*.tmp
 .claude/
 *.log
